@@ -1104,7 +1104,7 @@ func (e *NSenterEvent) processMountSyscallRequest() error {
 
 		// Create a dummy 'process' struct to represent the 'sysbox-fs nsenter' process
 		// executing this logic.
-		pid := os.Getpid()
+		pid := process.ProcSelfPid()
 		this := e.service.prs.ProcessCreate(uint32(pid), 0, 0)
 
 		// Adjust 'nsenter' process personality to match the container's original
@@ -1272,7 +1272,7 @@ func (e *NSenterEvent) processGetxattrSyscallRequest() error {
 
 	// Create a 'process' struct to represent the 'sysbox-fs nsenter' process
 	// executing this logic.
-	pid := os.Getpid()
+	pid := process.ProcSelfPid()
 	this := e.service.prs.ProcessCreate(uint32(pid), 0, 0)
 
 	// Adjust 'nsenter' process personality to match the container's original
@@ -1356,7 +1356,7 @@ func (e *NSenterEvent) processListxattrSyscallRequest() error {
 
 	// Create a 'process' struct to represent the 'sysbox-fs nsenter' process
 	// executing this logic.
-	pid := os.Getpid()
+	pid := process.ProcSelfPid()
 	this := e.service.prs.ProcessCreate(uint32(pid), 0, 0)
 
 	// Adjust 'nsenter' process personality to match the container's original
@@ -1451,7 +1451,7 @@ func (e *NSenterEvent) getProcCreds(pipe *os.File) error {
 
 func (e *NSenterEvent) processMountInfoRequest() error {
 
-	pid := os.Getpid()
+	pid := process.ProcSelfPid()
 
 	// Create a 'process' struct to represent the 'sysbox-fs nsenter' process
 	// executing this logic.
@@ -1605,7 +1605,7 @@ func (e *NSenterEvent) processOpenat2SyscallRequest(pipe *os.File) (int, error) 
 	// Adjust nsenter personality (uid/gid and capabilities) to match
 	// the original process performing the syscall. This is needed to
 	// ensure proper permission checks when opening the file.
-	pid := os.Getpid()
+	pid := process.ProcSelfPid()
 	this := e.service.prs.ProcessCreate(uint32(pid), 0, 0)
 
 	if err := this.AdjustPersonality(
