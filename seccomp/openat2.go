@@ -20,11 +20,13 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"github.com/nestybox/sysbox-fs/domain"
 	"github.com/nestybox/sysbox-fs/fuse"
 	"github.com/nestybox/sysbox-fs/mount"
+	libseccomp "github.com/seccomp/libseccomp-golang"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
 )
@@ -47,6 +49,67 @@ const (
 	RESOLVE_IN_ROOT       = 0x10
 	RESOLVE_CACHED        = 0x20
 )
+
+// openat2Attempts bounds the opens processOpenat2 makes for one openat2 of a
+// file under a sysbox-fs mount. Each goes through an nsenter agent -- a
+// process sysbox-fs starts, which enters the caller's namespaces, opens the
+// file and hands its fd back over a socket -- and on a loaded host that agent
+// now and then fails for reasons of its own (it dies, its socket resets, a
+// message it was to send never comes): sysbox-fs is one daemon for every
+// container on its host. Each such failure answered the caller EINVAL for a
+// call it made right: runc's writes of a container's sysctls, docker's
+// net.ipv4.ip_unprivileged_port_start among them, failed its start with
+// "unsafe procfs detected: openat2 /proc/./sys/...: invalid argument". The
+// open is tried again instead, a few times, while the caller still waits on
+// it; opening a file under /proc/sys changes nothing, so a second try is the
+// first's answer.
+const openat2Attempts = 3
+
+// openat2Backoff is how long processOpenat2 waits before another try at
+// <attempt> + 1.
+func openat2Backoff(attempt int) time.Duration {
+	return time.Duration(attempt) * 50 * time.Millisecond
+}
+
+// openat2Again says whether processOpenat2 tries the open once more after
+// attempt <attempt> failed in the nsenter agent (<agentErr>), or in the
+// injection of the fd it opened into the caller (<injectErr>), and the
+// caller's notification is still one it waits on (<waiting>). An open the
+// agent made and the file system refused (EACCES, ENOENT, ...) is the
+// caller's answer, and never comes here. An injection is not tried again: the
+// kernel refuses one only when the caller's call was interrupted or it is
+// gone (ESRCH, ENOENT), which the kernel then restarts or nobody waits on, or
+// for what a second try does not change (EMFILE, EBADF).
+func openat2Again(attempt int, agentErr, injectErr error, waiting bool) bool {
+	if attempt >= openat2Attempts || !waiting || injectErr != nil {
+		return false
+	}
+	return agentErr != nil
+}
+
+// openat2Retried runs <once> -- an open through an nsenter agent and the
+// injection of its fd -- until it answers the caller, or openat2Again says to
+// stop, <waiting> saying whether the caller's notification is still one it
+// waits on: the answer, or what failed last, the agent (<agentErr>) or the
+// injection (<injectErr>). <retrying> is told each attempt that failed before
+// the next. Args: once, waiting, retrying
+func openat2Retried(
+	once func() (*sysResponse, error, error),
+	waiting func() bool,
+	retrying func(attempt int, agentErr error)) (*sysResponse, error, error) {
+
+	for attempt := 1; ; attempt++ {
+		resp, agentErr, injectErr := once()
+		if resp != nil {
+			return resp, nil, nil
+		}
+		if !openat2Again(attempt, agentErr, injectErr, waiting()) {
+			return nil, agentErr, injectErr
+		}
+		retrying(attempt, agentErr)
+		time.Sleep(openat2Backoff(attempt))
+	}
+}
 
 // openat2SyscallInfo holds the parsed arguments for openat2 syscall
 type openat2SyscallInfo struct {
@@ -160,60 +223,86 @@ func (si *openat2SyscallInfo) processOpenat2() (*sysResponse, error) {
 			CheckForSysboxfs: true, // ensure the openat2 is opening a sysbox-fs managed file
 		}
 
-		nss := t.service.nss
-		event := nss.NewEvent(
-			si.pid,
-			si.uid,
-			si.gid,
-			&domain.AllNSs,
-			0,
-			&domain.NSenterMessage{
-				Type:    domain.Openat2SyscallRequest,
-				Payload: payload,
+		resp, agentErr, _ := openat2Retried(
+			func() (*sysResponse, error, error) { return si.openat2Once(payload, fullPath) },
+			func() bool {
+				return libseccomp.NotifIDValid(libseccomp.ScmpFd(si.notifyFd), si.reqId) == nil
 			},
-			nil,
-			false,
-		)
-
-		// Launch nsenter-event
-		err := nss.SendRequestEvent(event)
-		if err != nil {
-			return nil, err
-		}
-
-		// Obtain nsenter-event response
-		responseMsg := nss.ReceiveResponseEvent(event)
-		if responseMsg.Type == domain.ErrorResponse {
-			resp := t.createErrorResponse(
-				si.reqId,
-				responseMsg.Payload.(fuse.IOerror).Code)
+			func(attempt int, err error) {
+				logrus.Warnf("openat2(): pid %d: the nsenter agent failed to open %s (attempt %d of %d): %v; trying again",
+					si.pid, fullPath, attempt, openat2Attempts, err)
+			})
+		if resp != nil {
 			return resp, nil
 		}
-
-		// Extract the opened file descriptor from the response (passed to sysbox-fs via SCM_RIGHTS by the nsenter process)
-		respPayload := responseMsg.Payload.(domain.Openat2RespPayload)
-		fd := respPayload.Fd
-
-		logrus.Infof("openat2(): pid %d: received fd %d from nsenter for path %s", si.pid, fd, fullPath)
-
-		// Inject the file descriptor into the traced process using SECCOMP_IOCTL_NOTIF_ADDFD
-		targetFd, err := si.injectFd(fd)
-
-		// Close the fd in sysbox-fs after injecting it (the target process now has a copy)
-		unix.Close(fd)
-
-		if err != nil {
-			logrus.Errorf("openat2(): pid %d: failed to inject fd %d into target process %d: %v", si.pid, fd, si.pid, err)
-			resp := t.createErrorResponse(si.reqId, syscall.EINVAL)
-			return resp, nil
+		// an agent's failure is processSyscall's EINVAL, as an injection's is here
+		if agentErr != nil {
+			return nil, agentErr
 		}
-
-		logrus.Infof("openat2(): pid %d: injected fd %d as %d for path %s", si.pid, fd, targetFd, fullPath)
-
-		// Return success response with the target fd as the return value
-		return t.createSuccessResponseWithRetValue(si.reqId, uint64(targetFd)), nil
+		return t.createErrorResponse(si.reqId, syscall.EINVAL), nil
 	}
 
 	// Otherwise let the kernel handle it
 	return t.createContinueResponse(si.reqId), nil
+}
+
+// openat2Once opens <fullPath> in the caller's namespaces through an nsenter
+// agent and injects the fd it opened into the caller. It answers the caller
+// (a response), or says what failed: the agent (<agentErr>), or the
+// injection (<injectErr>).
+func (si *openat2SyscallInfo) openat2Once(
+	payload domain.Openat2SyscallPayload,
+	fullPath string) (*sysResponse, error, error) {
+
+	t := si.tracer
+	nss := t.service.nss
+	event := nss.NewEvent(
+		si.pid,
+		si.uid,
+		si.gid,
+		&domain.AllNSs,
+		0,
+		&domain.NSenterMessage{
+			Type:    domain.Openat2SyscallRequest,
+			Payload: payload,
+		},
+		nil,
+		false,
+	)
+
+	// Launch nsenter-event
+	if err := nss.SendRequestEvent(event); err != nil {
+		return nil, err, nil
+	}
+
+	// Obtain nsenter-event response
+	responseMsg := nss.ReceiveResponseEvent(event)
+	if responseMsg.Type == domain.ErrorResponse {
+		resp := t.createErrorResponse(
+			si.reqId,
+			responseMsg.Payload.(fuse.IOerror).Code)
+		return resp, nil, nil
+	}
+
+	// Extract the opened file descriptor from the response (passed to sysbox-fs via SCM_RIGHTS by the nsenter process)
+	respPayload := responseMsg.Payload.(domain.Openat2RespPayload)
+	fd := respPayload.Fd
+
+	logrus.Infof("openat2(): pid %d: received fd %d from nsenter for path %s", si.pid, fd, fullPath)
+
+	// Inject the file descriptor into the traced process using SECCOMP_IOCTL_NOTIF_ADDFD
+	targetFd, err := si.injectFd(fd)
+
+	// Close the fd in sysbox-fs after injecting it (the target process now has a copy)
+	unix.Close(fd)
+
+	if err != nil {
+		logrus.Errorf("openat2(): pid %d: failed to inject fd %d into target process %d: %v", si.pid, fd, si.pid, err)
+		return nil, nil, err
+	}
+
+	logrus.Infof("openat2(): pid %d: injected fd %d as %d for path %s", si.pid, fd, targetFd, fullPath)
+
+	// Return success response with the target fd as the return value
+	return t.createSuccessResponseWithRetValue(si.reqId, uint64(targetFd)), nil, nil
 }
