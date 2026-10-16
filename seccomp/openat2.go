@@ -90,9 +90,9 @@ func openat2Again(attempt int, agentErr, injectErr error, waiting bool) bool {
 // openat2Retried runs <once> -- an open through an nsenter agent and the
 // injection of its fd -- until it answers the caller, or openat2Again says to
 // stop, <waiting> saying whether the caller's notification is still one it
-// waits on: the answer, or what failed last, the agent (<agentErr>) or the
-// injection (<injectErr>). <retrying> is told each attempt that failed before
-// the next. Args: once, waiting, retrying
+// waits on -- before each wait and after it -- : the answer, or what failed
+// last, the agent (<agentErr>) or the injection (<injectErr>). <retrying> is
+// told each attempt that failed before the next. Args: once, waiting, retrying
 func openat2Retried(
 	once func() (*sysResponse, error, error),
 	waiting func() bool,
@@ -108,6 +108,11 @@ func openat2Retried(
 		}
 		retrying(attempt, agentErr)
 		time.Sleep(openat2Backoff(attempt))
+		// and still, after the wait: a caller gone meanwhile gets no agent,
+		// which would enter the namespaces of whatever holds its tid by then
+		if !waiting() {
+			return nil, agentErr, nil
+		}
 	}
 }
 

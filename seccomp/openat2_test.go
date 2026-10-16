@@ -77,22 +77,24 @@ func Test_openat2Retried(t *testing.T) {
 		agentFails int   // attempts whose agent fails before one answers
 		injectErr  error // what each injection says, once the agent opened it
 		waiting    bool
+		goneAfter  int // the caller waits no more after this many looks (0: as waiting says)
 		wantCalls  int
 		wantAnswer bool
 		wantAgent  bool
 		wantInject bool
 	}{
-		{"an agent that fails once: answered at the second", 1, nil, true, 2, true, false, false},
-		{"an agent that fails twice: answered at the third", 2, nil, true, 3, true, false, false},
-		{"an agent that always fails: given up at the last", 99, nil, true, openat2Attempts, false, true, false},
-		{"an agent that fails, the caller gone: given up at once", 99, nil, false, 1, false, true, false},
-		{"an injection that fails: given up at once", 0, unix.ESRCH, true, 1, false, false, true},
-		{"an agent and an injection that answer: one attempt", 0, nil, true, 1, true, false, false},
+		{"an agent that fails once: answered at the second", 1, nil, true, 0, 2, true, false, false},
+		{"an agent that fails twice: answered at the third", 2, nil, true, 0, 3, true, false, false},
+		{"an agent that always fails: given up at the last", 99, nil, true, 0, openat2Attempts, false, true, false},
+		{"an agent that fails, the caller gone: given up at once", 99, nil, false, 0, 1, false, true, false},
+		{"an agent that fails, the caller gone during the wait: no other agent", 99, nil, true, 1, 1, false, true, false},
+		{"an injection that fails: given up at once", 0, unix.ESRCH, true, 0, 1, false, false, true},
+		{"an agent and an injection that answer: one attempt", 0, nil, true, 0, 1, true, false, false},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			calls, retried := 0, 0
+			calls, retried, looks := 0, 0, 0
 			once := func() (*sysResponse, error, error) {
 				calls++
 				if calls <= tt.agentFails {
@@ -104,12 +106,15 @@ func Test_openat2Retried(t *testing.T) {
 				return answer, nil, nil
 			}
 			resp, agentErr, injectErr := openat2Retried(once,
-				func() bool { return tt.waiting },
+				func() bool {
+					looks++
+					return tt.waiting && (tt.goneAfter == 0 || looks <= tt.goneAfter)
+				},
 				func(int, error) { retried++ })
 			if calls != tt.wantCalls {
 				t.Errorf("%d attempts, want %d", calls, tt.wantCalls)
 			}
-			if retried != calls-1 {
+			if retried != calls-1 && !(tt.goneAfter > 0 && retried == calls) {
 				t.Errorf("told of %d retries for %d attempts", retried, calls)
 			}
 			if (resp == answer) != tt.wantAnswer || (agentErr != nil) != tt.wantAgent || (injectErr != nil) != tt.wantInject {
