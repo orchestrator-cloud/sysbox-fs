@@ -190,6 +190,18 @@ func (e *NSenterEvent) processResponse(pipe *os.File) error {
 	if err != nil {
 		return err
 	}
+	// Every fd received is this process's from here: the one a response hands
+	// on (an openat2's) is kept, and every other closed however this ends --
+	// an agent's error reply came with one, and each such reply was an fd
+	// sysbox-fs kept for the rest of its life.
+	handed := -1
+	defer func() {
+		for i, fd := range fds {
+			if i != handed {
+				unix.Close(fd)
+			}
+		}
+	}()
 
 	// Now decode the JSON response
 	// Raw message payload to aid in decoding generic messages (see below
@@ -503,6 +515,7 @@ func (e *NSenterEvent) processResponse(pipe *os.File) error {
 		}
 
 		p.Fd = fds[0]
+		handed = 0
 
 		// Insert the received fd into the response payload
 		e.ResMsg = &domain.NSenterMessage{
@@ -1623,7 +1636,8 @@ func (e *NSenterEvent) processOpenat2SyscallRequest(pipe *os.File) (int, error) 
 			Type:    domain.ErrorResponse,
 			Payload: &fuse.IOerror{RcvError: err},
 		}
-		return 0, nil
+		// no fd: 0 here was the agent's own stdin, sent across and kept
+		return -1, nil
 	}
 
 	// note: the fd is not sent in the response; rather it's sent separately via SCM_RIGHTS so it
@@ -1973,8 +1987,11 @@ func (e *NSenterEvent) processRequest(pipe *os.File) error {
 			return err
 		}
 
-		// Store the file descriptor (to be sent later via SCM_RIGHTS)
-		e.fileDescr = []int{fd}
+		// Store the file descriptor (to be sent later via SCM_RIGHTS), when
+		// there is one: a refusal's -1 failed the reply's sendmsg (EBADF), so
+		// its dummy byte never went, sysbox-fs read the reply's first byte in
+		// its place, and the refusal reached it as the agent's failure.
+		e.fileDescr = openat2ReplyFds(fd)
 		return nil
 
 	default:
@@ -1985,6 +2002,15 @@ func (e *NSenterEvent) processRequest(pipe *os.File) error {
 	}
 
 	return nil
+}
+
+// openat2ReplyFds is what an agent hands sysbox-fs for an openat2 it was
+// asked: the fd it opened, or none for a refusal (-1).
+func openat2ReplyFds(fd int) []int {
+	if fd < 0 {
+		return nil
+	}
+	return []int{fd}
 }
 
 // nsenter process initialization function. To be executed within the
@@ -2028,20 +2054,27 @@ func Init() (err error) {
 		}
 	}
 
+	return event.sendReply(pipe)
+}
+
+// sendReply sends the agent's reply to sysbox-fs: the fds it hands over
+// (e.fileDescr, if any) out-of-band via SCM_RIGHTS, then e.ResMsg as JSON.
+func (e *NSenterEvent) sendReply(pipe *os.File) error {
+
 	// Send any response file descriptors out-of-band via SCM_RIGHTS.
 	// Note: we must always do this, even if there are no fds to send; otherwise
 	// the receiver (sysbox-fs) will block waiting for an fd that never comes.
-	rights := syscall.UnixRights(event.fileDescr...)
-	err = syscall.Sendmsg(int(pipe.Fd()), nil, rights, nil, 0)
-	if err != nil && event.ResMsg == nil {
-		event.ResMsg = &domain.NSenterMessage{
+	rights := syscall.UnixRights(e.fileDescr...)
+	err := syscall.Sendmsg(int(pipe.Fd()), nil, rights, nil, 0)
+	if err != nil && e.ResMsg == nil {
+		e.ResMsg = &domain.NSenterMessage{
 			Type:    domain.ErrorResponse,
 			Payload: &fuse.IOerror{RcvError: err},
 		}
 	}
 
 	// Now encode and send the JSON response.
-	data, err := json.Marshal(*(event.ResMsg))
+	data, err := json.Marshal(*(e.ResMsg))
 	if err != nil {
 		return err
 	}
