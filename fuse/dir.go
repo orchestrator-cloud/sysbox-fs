@@ -246,6 +246,8 @@ func (d *Dir) Create(
 	}
 
 	resp.Flags |= fuse.OpenDirectIO
+	// The new file is closed like any other: no FLUSH (see File.Open).
+	resp.Flags |= openNoFlush
 	if nonSeekable {
 		resp.Flags |= fuse.OpenNonSeekable
 	}

@@ -166,12 +166,32 @@ func (f *File) Open(
 	//
 	resp.Flags |= fuse.OpenDirectIO
 
+	//
+	// No FLUSH on close (sysbox#1018). Each close() of a file on this mount
+	// makes the kernel run fuse_flush() first and wait there for the FLUSH
+	// answer; every reported node wedge (tasks in D state in fuse_flush, the
+	// node's load climbing until a reboot) sits in that step. sysbox-fs has
+	// nothing to flush: its handles have no Flush method, so bazil answers a
+	// FLUSH having done nothing, and the mount keeps no dirty pages. With
+	// FOPEN_NOFLUSH, fuse_flush() returns before it takes the inode lock or
+	// sends any request.
+	//
+	// The kernel honours the flag only on a mount without a writeback cache:
+	// a WritebackCache() mount option (fuse/server.go) would void it, so any
+	// such change must look at this again. Kernels older than 5.16 ignore it.
+	//
+	resp.Flags |= openNoFlush
+
 	if nonSeekable {
 		resp.Flags |= fuse.OpenNonSeekable
 	}
 
 	return f, nil
 }
+
+// openNoFlush is the kernel's FOPEN_NOFLUSH (include/uapi/linux/fuse.h, Linux
+// 5.16+). bazil's list of open answer flags stops at OpenCacheDir (1 << 3).
+const openNoFlush = fuse.OpenResponseFlags(1 << 5)
 
 // Release FS operation.
 func (f *File) Release(ctx context.Context, req *fuse.ReleaseRequest) error {
