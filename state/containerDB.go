@@ -17,6 +17,7 @@
 package state
 
 import (
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -333,7 +334,7 @@ func (css *containerStateService) ContainerUnregister(c domain.ContainerIface) e
 	// Destroy the fuse server for the container. As with its creation, this
 	// blocks on the kernel FUSE unmount, so do it without holding the lock.
 	err := css.fss.DestroyFuseServer(cntr.id)
-	if err != nil {
+	if err != nil && !errors.Is(err, domain.ErrFuseServerNotPresent) {
 		logrus.Errorf("Container unregistration error: unable to destroy fuseServer for container %s",
 			cntr.id)
 		return grpcStatus.Errorf(

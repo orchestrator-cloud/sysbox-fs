@@ -95,14 +95,23 @@ func (fss *FuseServerService) CreateFuseServer(serveCntr, stateCntr domain.Conta
 	fss.RLock()
 	if _, ok := fss.serversMap[cntrId]; ok {
 		fss.RUnlock()
-		logrus.Errorf("FuseServer to create is already present for container id %s",
+		logrus.Warnf("FuseServer to create is already present for container id %s",
 			cntrId)
-		return errors.New("FuseServer already present")
+		return domain.ErrFuseServerPresent
 	}
 	fss.RUnlock()
 
-	// Create required mountpoint in host file-system.
 	cntrMountpoint := filepath.Join(fss.mountPoint, cntrId)
+
+	// A sysboxfs mount left at the mountpoint by a server that was forgotten
+	// without its unmount is detached first, so the new mount never stacks on
+	// it. (Before the mkdir: the stat of a dead fuse mount fails.)
+	if err := detachLeftovers(cntrMountpoint); err != nil {
+		logrus.Errorf("FuseServer mountpoint for container id %s: %v", cntrId, err)
+		return errors.New("FuseServer with invalid mountpoint")
+	}
+
+	// Create required mountpoint in host file-system.
 	mountpointIOnode := fss.ios.NewIOnode("", cntrMountpoint, 0600)
 	if err := mountpointIOnode.MkdirAll(); err != nil {
 		return errors.New("FuseServer with invalid mountpoint")
@@ -141,39 +150,35 @@ func (fss *FuseServerService) CreateFuseServer(serveCntr, stateCntr domain.Conta
 	return nil
 }
 
-// Destroy a fuse-server.
+// Destroy a fuse-server. It returns ErrFuseServerNotPresent when the id has
+// none, and nil otherwise: a failed unmount is logged, not returned, so that
+// runc delete does not fail on it.
 func (fss *FuseServerService) DestroyFuseServer(cntrId string) error {
 
-	// Ensure fuse-server to eliminate is present.
-	fss.RLock()
+	// Forget the server first, whatever its destroy does: a server kept here
+	// refuses every later start of the container.
+	fss.Lock()
 	srv, ok := fss.serversMap[cntrId]
+	delete(fss.serversMap, cntrId)
+	fss.Unlock()
 	if !ok {
-		fss.RUnlock()
-		logrus.Errorf("FuseServer to destroy is not present for container id %s",
+		logrus.Debugf("FuseServer to destroy is not present for container id %s",
 			cntrId)
-		return nil
+		return domain.ErrFuseServerNotPresent
 	}
-	fss.RUnlock()
 
 	// Destroy fuse-server.
 	if err := srv.Destroy(); err != nil {
-		logrus.Errorf("FuseServer to destroy could not be eliminated for container id %s",
-			cntrId)
-		return nil
+		logrus.Errorf("FuseServer to destroy could not be eliminated for container id %s: %v",
+			cntrId, err)
 	}
 
 	// Remove mountpoint dir from host file-system.
 	cntrMountpoint := filepath.Join(fss.mountPoint, cntrId)
 	if err := os.Remove(cntrMountpoint); err != nil {
-		logrus.Errorf("FuseServer mountpoint could not be eliminated for container id %s",
-			cntrId)
-		return nil
+		logrus.Errorf("FuseServer mountpoint could not be eliminated for container id %s: %v",
+			cntrId, err)
 	}
-
-	// Update state.
-	fss.Lock()
-	delete(fss.serversMap, cntrId)
-	fss.Unlock()
 
 	logrus.Debugf("Destroyed fuse server for container %s", cntrId)
 

@@ -88,8 +88,3 @@ func (_m *FuseServerIface) Run() error {
 func (_m *FuseServerIface) SetCntrRegComplete() {
 	_m.Called()
 }
-
-// Unmount provides a mock function with given fields:
-func (_m *FuseServerIface) Unmount() {
-	_m.Called()
-}

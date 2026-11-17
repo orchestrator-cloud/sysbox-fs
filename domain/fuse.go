@@ -16,6 +16,14 @@
 
 package domain
 
+import "errors"
+
+// CreateFuseServer's answer when the id already has a server.
+var ErrFuseServerPresent = errors.New("FuseServer already present")
+
+// DestroyFuseServer's answer when the id has no server.
+var ErrFuseServerNotPresent = errors.New("FuseServer not present")
+
 type FuseServerServiceIface interface {
 	Setup(
 		mp string,
@@ -34,7 +42,6 @@ type FuseServerIface interface {
 	Run() error
 	Destroy() error
 	MountPoint() string
-	Unmount()
 	InitWait() bool
 	SetCntrRegComplete()
 	IsCntrRegCompleted() bool

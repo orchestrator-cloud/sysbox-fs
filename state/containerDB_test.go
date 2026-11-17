@@ -835,3 +835,29 @@ func TestContainerStateService_FuseServerLifecycleDoesNotBlock(t *testing.T) {
 		t.Fatalf("ContainerUnregister() error = %v", err)
 	}
 }
+
+func newTestCss(fss domain.FuseServerServiceIface) *containerStateService {
+	css := NewContainerStateService().(*containerStateService)
+	css.Setup(fss, prs, ios, mts)
+	return css
+}
+
+// An entry whose fuse server is already gone (its pre-registration was still
+// mounting when the unregister came) unregisters cleanly: runc delete must
+// not fail on it.
+func TestUnregisterOfAnEntryWithoutAServerSucceeds(t *testing.T) {
+	fss := &mocks.FuseServerServiceIface{}
+	fss.On("CreateFuseServer", mock.Anything, mock.Anything).Return(nil)
+	fss.On("DestroyFuseServer", "c1").Return(domain.ErrFuseServerNotPresent)
+	css := newTestCss(fss)
+	if err := css.ContainerPreRegister("c1", ""); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := css.ContainerUnregister(css.ContainerLookupById("c1")); err != nil {
+		t.Errorf("ContainerUnregister() = %v, want nil", err)
+	}
+	if css.ContainerLookupById("c1") != nil {
+		t.Errorf("the entry for c1 is still there")
+	}
+}

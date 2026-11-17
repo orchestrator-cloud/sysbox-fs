@@ -18,8 +18,12 @@ package fuse
 
 import (
 	"errors"
+	"fmt"
+	"io"
 	"os"
+	"path/filepath"
 	"sync"
+	"sync/atomic"
 
 	bfuse "bazil.org/fuse"
 	bfusefs "bazil.org/fuse/fs"
@@ -45,6 +49,11 @@ type fuseServer struct {
 	initDone     chan bool                // sync-up channel to alert about fuse-server's init-completion
 	cntrReg      bool                     // flag to track the container's registration state
 	service      *FuseServerService       // backpointer to parent service
+	connDev      string                   // the connection's major:minor in mountinfo, read at mount
+	unmountOnce  sync.Once                // one unmount, for Run's exit and Destroy
+	unmounted    string                   // what the unmount found and did
+	unmountErr   error                    // the unmount's error
+	destroying   atomic.Bool              // Destroy has started
 }
 
 func NewFuseServer(
@@ -143,12 +152,19 @@ func (s *fuseServer) Run() error {
 	}
 	s.conn = c
 
+	// The connection's identity, so that its unmount never takes another
+	// connection's mount off the path.
+	dev, devErr := connDevAt(s.mountPoint)
+	if devErr != nil {
+		logrus.Errorf("FUSE server for container %s: %v; its unmount will leave the mount, for the next start to detach",
+			s.cntrID(), devErr)
+	}
+	s.connDev = dev
+
 	// Deferred routine to enforce a clean exit should an unrecoverable error is
 	// ever returned from fuse-lib.
-	defer func() {
-		s.Unmount()
-		c.Close()
-	}()
+	var serveErr error
+	defer func() { s.serveEnded(c, serveErr) }()
 
 	if p := c.Protocol(); !p.HasInvalidate() {
 		logrus.Panic("Kernel FUSE support is too old to have invalidations: version ", p)
@@ -167,22 +183,63 @@ func (s *fuseServer) Run() error {
 	s.initDone <- true
 
 	// Launch fuse-server's main-loop to handle incoming requests.
-	if err := s.server.Serve(s); err != nil {
-		logrus.Panic(err)
-		return err
+	if serveErr = s.server.Serve(s); serveErr != nil {
+		logrus.Panic(serveErr)
+		return serveErr
 	}
 
 	return nil
 }
 
+// serveEnded is Run's exit: the serve loop has ended, because Destroy took
+// the mount away, or because the connection was aborted (the fuse guard) or
+// failed. It unmounts (once: Destroy may have done it), closes the device,
+// and says so in one line.
+func (s *fuseServer) serveEnded(c io.Closer, serveErr error) {
+	unmounted, err := s.unmount()
+	c.Close()
+
+	// Not s.container: Destroy may be unsetting it.
+	if s.destroying.Load() {
+		logrus.Debugf("FUSE server for container %s stopped serving after its destroy", s.cntrID())
+		return
+	}
+	why := "its connection ended (aborted, or unmounted from outside)"
+	if serveErr != nil {
+		why = fmt.Sprintf("serving failed: %v", serveErr)
+	}
+	if err != nil {
+		logrus.Warnf("FUSE server for container %s stopped serving before its destroy: %s; unmount failed: %v",
+			s.cntrID(), why, err)
+		return
+	}
+	logrus.Warnf("FUSE server for container %s stopped serving before its destroy: %s; mount %s",
+		s.cntrID(), why, unmounted)
+}
+
+// unmount takes the connection's mount off its mountpoint, once: Run's exit
+// and Destroy both call it, and the later call gets the first one's result.
+func (s *fuseServer) unmount() (string, error) {
+	s.unmountOnce.Do(func() {
+		s.unmounted, s.unmountErr = unmountConn(s.mountPoint, s.connDev)
+	})
+	return s.unmounted, s.unmountErr
+}
+
+// The container id, from the mountpoint (<base>/<id>).
+func (s *fuseServer) cntrID() string {
+	return filepath.Base(s.mountPoint)
+}
+
 func (s *fuseServer) Destroy() error {
+	s.destroying.Store(true)
 
 	// Unmount sysboxfs from mountpoint.
-	err := bfuse.Unmount(s.mountPoint)
+	unmounted, err := s.unmount()
 	if err != nil {
-		logrus.Errorf("FUSE file-system could not be unmounted: %v", err)
 		return err
 	}
+	logrus.Debugf("FUSE server for container %s: mount %s", s.cntrID(), unmounted)
 
 	// Unset pointers for GC purposes.
 	s.container = nil
@@ -211,11 +268,6 @@ func (s *fuseServer) InitWait() bool {
 func (s *fuseServer) MountPoint() string {
 
 	return s.mountPoint
-}
-
-func (s *fuseServer) Unmount() {
-
-	bfuse.Unmount(s.mountPoint)
 }
 
 // Helper functions to extract the container UID and GID (below) corresponding to
