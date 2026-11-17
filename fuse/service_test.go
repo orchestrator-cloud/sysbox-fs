@@ -364,6 +364,24 @@ type idContainer struct {
 
 func (c idContainer) ID() string { return c.id }
 
+// The two answers the state and ipc services act on: a create for an id that
+// has a server (pre-registration destroys it and mounts anew), and a destroy
+// for an id that has none (unregister treats it as done).
+func TestTheServiceSaysWhenAServerIsPresentOrNot(t *testing.T) {
+	fakeFusermount(t, 1)
+	fss, _ := newDestroyTestService(t, "c1")
+
+	if err := fss.CreateFuseServer(idContainer{id: "c1"}, idContainer{id: "c1"}); !errors.Is(err, domain.ErrFuseServerPresent) {
+		t.Errorf("CreateFuseServer() for an id with a server = %v, want ErrFuseServerPresent", err)
+	}
+	if err := fss.DestroyFuseServer("c1"); err != nil {
+		t.Errorf("DestroyFuseServer() = %v, want nil", err)
+	}
+	if err := fss.DestroyFuseServer("c1"); !errors.Is(err, domain.ErrFuseServerNotPresent) {
+		t.Errorf("DestroyFuseServer() for an id with no server = %v, want ErrFuseServerNotPresent", err)
+	}
+}
+
 // A sysboxfs mount left at the container's path (a server forgotten without
 // its unmount) is detached before the new server mounts, so mounts never
 // stack; a mount that is not sysbox-fs's is left alone.
