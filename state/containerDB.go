@@ -111,21 +111,37 @@ func (css *containerStateService) ContainerPreRegister(id, netns string) error {
 
 	css.Lock()
 
-	// Ensure that new container's id is not already present.
-	if _, ok := css.idTable[id]; ok {
-		css.Unlock()
-		logrus.Errorf("Container pre-registration error: container %s already present",
-			formatter.ContainerID{id})
-		return grpcStatus.Errorf(
-			grpcCodes.AlreadyExists,
-			"Container %s already pre-registered",
-			id,
-		)
+	// Ensure that new container's id is not already present, unless its entry
+	// is stale: it serves nobody, and keeping it would refuse every start of
+	// the container until sysbox-fs restarts.
+	replaced := false
+	if old, ok := css.idTable[id]; ok {
+		stale := staleEntry(old)
+		if stale == "" {
+			css.Unlock()
+			logrus.Errorf("Container pre-registration error: container %s already present",
+				formatter.ContainerID{id})
+			return grpcStatus.Errorf(
+				grpcCodes.AlreadyExists,
+				"Container %s already pre-registered",
+				id,
+			)
+		}
+
+		logrus.Warnf("Container pre-registration: replacing the entry of container %s: %s",
+			formatter.ContainerID{id}, stale)
+		if fd := old.InitPidFd(); fd != 0 {
+			unix.Close(int(fd))
+		}
+		css.untrackNetns(old)
+		delete(css.idTable, id)
+		replaced = true
 	}
 
 	cntr := &container{
-		id:      id,
-		service: css,
+		id:             id,
+		service:        css,
+		preRegistering: true,
 	}
 
 	stateCntr = cntr
@@ -179,12 +195,31 @@ func (css *containerStateService) ContainerPreRegister(id, netns string) error {
 	// other containers can be registered / looked up in the meantime.
 	css.Unlock()
 
+	// The replaced entry's fuse server goes with it.
+	if replaced {
+		css.fss.DestroyFuseServer(id)
+	}
+
 	err := css.fss.CreateFuseServer(cntr, stateCntr)
+	if errors.Is(err, domain.ErrFuseServerPresent) {
+		// A fuse server with no entry here serves nobody: every serving
+		// container has one. (sysbox-fs .4 kept the server of a failed
+		// destroy.) Destroy it, and mount anew.
+		logrus.Warnf("Container pre-registration: destroying the fuse server left for container %s",
+			formatter.ContainerID{id})
+		css.fss.DestroyFuseServer(id)
+		err = css.fss.CreateFuseServer(cntr, stateCntr)
+	}
+
+	css.Lock()
+	cntr.preRegistering = false
 	if err != nil {
-		css.Lock()
 		css.untrackNetns(cntr)
 		delete(css.idTable, cntr.id)
-		css.Unlock()
+	}
+	css.Unlock()
+
+	if err != nil {
 		logrus.Errorf("Container pre-registration error: unable to initialize fuseServer for container %s: %s",
 			formatter.ContainerID{id}, err)
 		return grpcStatus.Errorf(
@@ -348,6 +383,28 @@ func (css *containerStateService) ContainerUnregister(c domain.ContainerIface) e
 		formatter.ContainerID{cntr.id})
 
 	return nil
+}
+
+// staleEntry says why an idTable entry serves nobody, or "" if it may: while
+// its pre-registration is in flight, and while its init runs. Called with the
+// service's lock held.
+func staleEntry(c *container) string {
+	if c.preRegistering {
+		return ""
+	}
+
+	pid := c.InitPid()
+	if pid == 0 {
+		return "it never registered (sysbox-runc stopped after its pre-registration)"
+	}
+
+	// pidfd_send_signal(2) answers ESRCH once the process has exited. Any
+	// other answer (no pidfd, an old kernel) keeps the entry.
+	if fd := c.InitPidFd(); fd != 0 && errors.Is(fd.SendSignal(unix.Signal(0), 0), unix.ESRCH) {
+		return fmt.Sprintf("its init (pid %d) has exited", pid)
+	}
+
+	return ""
 }
 
 func (css *containerStateService) ContainerLookupById(id string) domain.ContainerIface {

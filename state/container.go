@@ -41,6 +41,7 @@ type container struct {
 	gidFirst        uint32                      // first value of Gid range (host side)
 	gidSize         uint32                      // Gid range size
 	regCompleted    bool                        // registration completion flag
+	preRegistering  bool                        // pre-registration in flight (under the service's lock)
 	procRoPaths     []string                    // OCI spec read-only proc paths
 	procMaskPaths   []string                    // OCI spec masked proc paths
 	mountInfoParser domain.MountInfoParserIface // Per container mountinfo DB & parser
