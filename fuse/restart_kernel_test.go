@@ -117,8 +117,14 @@ func TestAnAbortedConnectionRestartsUnderItsID(t *testing.T) {
 		t.Fatalf("CreateFuseServer() for the same id after the abort = %v: the box is locked out", err)
 	}
 	again := kernelTestConnDev(t, mp)
-	if again == "" || again == dev {
-		t.Fatalf("after the restart the mount at %s is on connection %q, want a fresh one (the aborted one was %s)", mp, again, dev)
+	if again == "" {
+		t.Fatalf("no sysboxfs mount at %s after the restart (the aborted connection was %s)", mp, dev)
+	}
+	// The kernel may give the fresh connection the minor the aborted one
+	// freed (Debian 13's 6.12 does): what tells them apart is that this one
+	// answers. The aborted one's every request fails ENOTCONN.
+	if _, err := os.Stat(mp); err != nil {
+		t.Fatalf("the mount at %s (connection %s) does not answer after the restart: %v", mp, again, err)
 	}
 
 	if err := fss.DestroyFuseServer(cntr.id); err != nil {
