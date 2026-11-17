@@ -29,6 +29,8 @@ import (
 	"github.com/nestybox/sysbox-fs/state"
 	grpc "github.com/nestybox/sysbox-ipc/sysboxFsGrpc"
 	"github.com/sirupsen/logrus"
+	grpcCodes "google.golang.org/grpc/codes"
+	grpcStatus "google.golang.org/grpc/status"
 )
 
 // Sysbox-fs global services for all state's pkg unit-tests.
@@ -368,6 +370,9 @@ func TestContainerUnregister(t *testing.T) {
 			wantErr: true,
 			prepare: func() {
 				css.On("ContainerLookupById", a1.data.Id).Return(nil)
+				fss := &mocks.FuseServerServiceIface{}
+				fss.On("DestroyFuseServer", a1.data.Id).Return(domain.ErrFuseServerNotPresent)
+				css.On("FuseServerService").Return(fss)
 			},
 		},
 	}
@@ -392,6 +397,42 @@ func TestContainerUnregister(t *testing.T) {
 
 			// Ensure that mocks were properly invoked.
 			css.AssertExpectations(t)
+		})
+	}
+}
+
+// An unregister of an id sysbox-fs has no entry for still destroys a server
+// left for it (sysbox-fs .4 kept one whose destroy failed), and answers
+// NotFound only when there was none.
+func TestUnregisterOfAnUnknownIdDestroysItsLeftoverServer(t *testing.T) {
+	var ctx = ipc.NewIpcService()
+	ctx.Setup(css, nil, nil, "/var/lib/sysboxfs")
+	data := &grpc.ContainerData{Id: "c1"}
+
+	for _, tc := range []struct {
+		name     string
+		leftover bool
+		wantCode grpcCodes.Code
+	}{
+		{"a leftover server", true, grpcCodes.OK},
+		{"no server", false, grpcCodes.NotFound},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			css.ExpectedCalls = nil
+			fss := &mocks.FuseServerServiceIface{}
+			var destroyErr error
+			if !tc.leftover {
+				destroyErr = domain.ErrFuseServerNotPresent
+			}
+			fss.On("DestroyFuseServer", "c1").Return(destroyErr).Once()
+			css.On("ContainerLookupById", "c1").Return(nil)
+			css.On("FuseServerService").Return(fss)
+
+			err := ipc.ContainerUnregister(ctx, data)
+			if grpcStatus.Code(err) != tc.wantCode {
+				t.Errorf("ContainerUnregister() = %v, want code %v", err, tc.wantCode)
+			}
+			fss.AssertExpectations(t)
 		})
 	}
 }

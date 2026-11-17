@@ -17,6 +17,8 @@
 package ipc
 
 import (
+	"errors"
+
 	"github.com/sirupsen/logrus"
 
 	"github.com/nestybox/sysbox-fs/domain"
@@ -111,11 +113,23 @@ func ContainerUnregister(ctx interface{}, data *grpc.ContainerData) error {
 	// Identify the container being unregistered.
 	cntr := ipcService.css.ContainerLookupById(data.Id)
 	if cntr == nil {
-		return grpcStatus.Errorf(
-			grpcCodes.NotFound,
-			"Container %s not found",
-			data.Id,
-		)
+		// A fuse server may still be left for the id (sysbox-fs .4 kept the
+		// server of a failed destroy): destroy it, so that runc delete, or an
+		// unregister run by hand, cleans it up.
+		err := ipcService.css.FuseServerService().DestroyFuseServer(data.Id)
+		if errors.Is(err, domain.ErrFuseServerNotPresent) {
+			return grpcStatus.Errorf(
+				grpcCodes.NotFound,
+				"Container %s not found",
+				data.Id,
+			)
+		}
+		if err != nil {
+			return err
+		}
+		logrus.Infof("Container unregistration: destroyed the fuse server left for container %s",
+			data.Id)
+		return nil
 	}
 
 	err := ipcService.css.ContainerUnregister(cntr)
