@@ -18,8 +18,10 @@ package nsenter
 
 import (
 	"os"
+	"runtime"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/nestybox/sysbox-fs/domain"
 	"github.com/nestybox/sysbox-fs/fuse"
@@ -27,14 +29,29 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// The fds this process holds.
+// The fds this process holds, once the count holds still: a file an earlier
+// test dropped is closed by its finalizer at a GC, which may otherwise come
+// between two counts.
 func openFds(t *testing.T) int {
 	t.Helper()
-	entries, err := os.ReadDir("/proc/self/fd")
-	if err != nil {
-		t.Fatalf("reading /proc/self/fd: %v", err)
+	count := func() int {
+		entries, err := os.ReadDir("/proc/self/fd")
+		if err != nil {
+			t.Fatalf("reading /proc/self/fd: %v", err)
+		}
+		return len(entries)
 	}
-	return len(entries)
+	n := count()
+	for i := 0; i < 10; i++ {
+		runtime.GC()
+		time.Sleep(10 * time.Millisecond)
+		m := count()
+		if m == n {
+			break
+		}
+		n = m
+	}
+	return n
 }
 
 // An agent's reply to an openat2 request, as it sends it: the open it made
