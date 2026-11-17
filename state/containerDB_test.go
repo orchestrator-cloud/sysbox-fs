@@ -34,6 +34,7 @@ import (
 	libpidfd "github.com/nestybox/sysbox-libs/pidfd"
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/mock"
+	"golang.org/x/sys/unix"
 	grpcCodes "google.golang.org/grpc/codes"
 	grpcStatus "google.golang.org/grpc/status"
 )
@@ -966,6 +967,9 @@ func TestPreRegisterReplacesAnEntryWhoseInitExited(t *testing.T) {
 
 	if err := css.ContainerPreRegister("c1", ""); err != nil {
 		t.Fatalf("ContainerPreRegister() after the init exited = %v, want nil", err)
+	}
+	if _, err := unix.FcntlInt(uintptr(old.initPidFd), unix.F_GETFD, 0); err != unix.EBADF {
+		t.Errorf("the replaced entry's pidfd %d is still open (fcntl: %v)", old.initPidFd, err)
 	}
 
 	checkEvents(t, events, "create c1", "destroy c1", "create c1")

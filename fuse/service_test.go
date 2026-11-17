@@ -72,10 +72,12 @@ type fakeMount struct {
 
 // A fake mount table behind the mountinfo and unmount seams. An unmount takes
 // the top mount at its path off the table, as the kernel does; the first
-// `busy` plain unmounts answer EBUSY instead.
+// `busy` plain unmounts answer EBUSY instead, and the first `raced` ones find
+// the mount already taken by another unmount (EINVAL).
 type fakeMounts struct {
 	mounts []fakeMount
 	busy   int
+	raced  int
 	calls  []string
 	events *[]string // shared with other fakes, to check the order of steps
 }
@@ -103,6 +105,11 @@ func (f *fakeMounts) unmount(path string, flags int) error {
 		return unix.EBUSY
 	}
 
+	raced := f.raced > 0
+	if raced {
+		f.raced--
+	}
+
 	// The top mount at the path is the one no other mount there sits on.
 	top := -1
 	for i, m := range f.mounts {
@@ -123,6 +130,9 @@ func (f *fakeMounts) unmount(path string, flags int) error {
 		return unix.EINVAL
 	}
 	f.mounts = append(f.mounts[:top], f.mounts[top+1:]...)
+	if raced {
+		return unix.EINVAL
+	}
 	return nil
 }
 
@@ -219,6 +229,27 @@ func TestDestroyDetachesABusyMountAndForgetsIt(t *testing.T) {
 	}
 	if len(f.mounts) != 0 {
 		t.Errorf("mounts left at the path: %v", f.mounts)
+	}
+	checkForgotten(t, fss, "c1")
+}
+
+// Another unmount took the mount between the table's read and umount2, which
+// then answers EINVAL: the table, read again, shows it gone, which is done.
+func TestDestroyReadsTheTableAgainAfterEINVAL(t *testing.T) {
+	fss, srv := newDestroyTestService(t, "c1")
+	srv.connDev = "0:99"
+	f := &fakeMounts{raced: 1, mounts: []fakeMount{
+		{id: 90, parent: 21, dev: "0:99", point: srv.mountPoint, fstype: "fuse", source: "sysboxfs"},
+	}}
+	useFakeMounts(t, f)
+
+	fss.DestroyFuseServer("c1")
+
+	if _, err := srv.unmount(); err != nil {
+		t.Errorf("Destroy's unmount = %v, want nil: the mount is gone", err)
+	}
+	if len(f.calls) != 1 {
+		t.Errorf("unmount calls %v, want 1", f.calls)
 	}
 	checkForgotten(t, fss, "c1")
 }
